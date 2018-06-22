@@ -1,0 +1,15 @@
+language: go
+go:
+- "1.7.x"
+- "1.8.x"
+- "1.9.x"
+- "1.10.x"
+- stable
+- master
+before_install:
+- go get gopkg.in/check.v1
+- mkdir -p vendor/gopkg.in
+- ln -s $(pwd) vendor/gopkg.in/pipe.v2
+scripts:
+- make test
+

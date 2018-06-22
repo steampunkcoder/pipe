@@ -2,6 +2,7 @@ package pipe_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -174,7 +175,7 @@ func (S) TestLineTermination(c *C) {
 		pipe.Exec("true"),
 	)
 	output, err := pipe.Output(p)
-	c.Assert(err, ErrorMatches, `command "true": write \|1: broken pipe`)
+	c.Assert(err, ErrorMatches, `io: read/write on closed pipe`)
 	c.Assert(string(output), Equals, "")
 }
 
@@ -844,4 +845,107 @@ func (S) TestRenameFileRelative(c *C) {
 	c.Assert(err, NotNil)
 	_, err = os.Stat(to)
 	c.Assert(err, IsNil)
+}
+
+func (S) TestCanceledContext(c *C) {
+	cancelableCtx, ctxCancelFn := context.WithCancel(context.Background())
+	defer ctxCancelFn()
+	go func() {
+		select {
+		case <-time.After(1 * time.Second):
+			ctxCancelFn()
+		}
+	}()
+	out, err := pipe.CombinedOutputContext(cancelableCtx, nil, pipe.Line(
+		pipe.Print("hello world\n"),
+		pipe.Exec("cat"),
+		pipe.Exec("sleep", "987654321"),
+	))
+	ctxCancelFn()
+	c.Assert(string(out), Equals, "")
+	c.Assert(err, ErrorMatches, context.Canceled.Error())
+}
+
+func (S) TestTimedoutContext(c *C) {
+	cancelableCtx, ctxCancelFn := context.WithTimeout(context.Background(), 1*time.Second)
+	defer ctxCancelFn()
+	out, err := pipe.CombinedOutputContext(cancelableCtx, nil, pipe.Line(
+		pipe.Print("hello world\n"),
+		pipe.Exec("cat"),
+		pipe.Exec("sleep", "987654321"),
+	))
+	ctxCancelFn()
+	c.Assert(string(out), Equals, "")
+	c.Assert(err, ErrorMatches, context.DeadlineExceeded.Error())
+}
+
+func (S) TestLogger(c *C) {
+	var mockLogger MockLogger
+	out, err := pipe.CombinedOutputContext(nil, &mockLogger, pipe.Script(
+		pipe.Print("print hello world\n"),
+		pipe.Exec("echo", "echo", "hello", "world"),
+	))
+	c.Assert(err, IsNil)
+	c.Assert(mockLogger[0], Equals, "pipe.Print print hello world\n")
+	c.Assert(mockLogger[1], Equals, "echo echo hello world\n")
+	c.Assert(string(out), Equals, "print hello world\necho hello world\n")
+}
+
+func (S) TestCountLines(c *C) {
+	p := pipe.Line(
+		pipe.System("echo out1; echo; echo err1 1>&2; echo out2; echo err2 1>&2; echo out3"),
+		pipe.CountLines(),
+	)
+	output, err := pipe.Output(p)
+	c.Assert(err, IsNil)
+	c.Assert(string(output), Equals, "4")
+}
+
+func (S) TestCountLinesNoNewLine(c *C) {
+	p := pipe.Line(
+		pipe.Print("out1\n\nout2\nout3"),
+		pipe.CountLines(),
+	)
+	output, err := pipe.Output(p)
+	c.Assert(err, IsNil)
+	c.Assert(string(output), Equals, "4")
+}
+
+func (S) TestCountLinesZeroLines(c *C) {
+	output, err := pipe.Output(pipe.CountLines())
+	c.Assert(err, IsNil)
+	c.Assert(string(output), Equals, "0")
+}
+
+func (S) TestReduce(c *C) {
+	p := pipe.Line(
+		pipe.System("echo out1; echo; echo err1 1>&2; echo out2; echo err2 1>&2; echo out3"),
+		pipe.Reduce(nil, func(x, y []byte) []byte {
+			return []byte(string(x) + strings.Replace(string(y), "\n", ";", -1))
+		}),
+	)
+	output, err := pipe.Output(p)
+	c.Assert(err, IsNil)
+	c.Assert(string(output), Equals, "out1;;out2;out3;")
+}
+
+func (S) TestReduceNoNewLine(c *C) {
+	p := pipe.Line(
+		pipe.Print("out1\n\nout2\nout3"),
+		pipe.Reduce(nil, func(x, y []byte) []byte {
+			return []byte(string(x) + strings.Replace(string(y), "\n", ";", -1))
+		}),
+	)
+	output, err := pipe.Output(p)
+	c.Assert(err, IsNil)
+	c.Assert(string(output), Equals, "out1;;out2;out3")
+}
+
+func (S) TestReduceZeroLines(c *C) {
+	output, err := pipe.Output(
+		pipe.Reduce(nil, func(x, y []byte) []byte {
+			return []byte(string(x) + strings.Replace(string(y), "\n", ";", -1))
+		}))
+	c.Assert(err, IsNil)
+	c.Assert(string(output), Equals, "")
 }

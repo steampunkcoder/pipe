@@ -35,6 +35,7 @@ package pipe
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -42,6 +43,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,6 +56,22 @@ import (
 // must not block reading or writing to the state streams. These
 // operations must be run from a Task.
 type Pipe func(s *State) error
+
+// StdLogger defines std log interface that is inexplicably not defined
+// by the standard golang log pkg.  StdLogger allows pipe pkg to use
+// any logging pkg that conforms to StdLogger (eg: log, logrus).
+// pipe pkg only uses a small subset of the std golang log api,
+// so only that small subset is defined in StdLogger.
+type StdLogger interface {
+
+	// Printf prints to logger.  Arguments handled like fmt.Printf.
+	// Newline appended if last character not already a newline.
+	Printf(format string, v ...interface{})
+
+	// Println prints to logger.  Arguments handled like fmt.Println.
+	// Newline appended if last character not already a newline.
+	Println(v ...interface{})
+}
 
 // A Task may be registered by a Pipe into a State to run any
 // activity concurrently with other tasks.
@@ -102,11 +120,17 @@ type State struct {
 	// If set to zero, the pipe will not be aborted.
 	Timeout time.Duration
 
+	// Ctx is the context used during execution.
+	// If nil, then context.Background() is used.
+	Ctx context.Context
+
 	killedMutex sync.Mutex
 	killedNoted bool
 	killed      chan bool
 
 	pendingTasks []*pendingTask
+
+	logger StdLogger
 }
 
 // NewState returns a new state for running pipes with.
@@ -166,12 +190,17 @@ func (pt *pendingTask) done(err error) {
 }
 
 var (
+	// ErrTimeout is error returned when task times out
 	ErrTimeout = errors.New("timeout")
-	ErrKilled  = errors.New("explicitly killed")
+
+	// ErrKilled is error returned when task explicitly killed
+	ErrKilled = errors.New("explicitly killed")
 )
 
+// Errors contains a list of all errors returned by tasks
 type Errors []error
 
+// Error implements error interface for Errors
 func (e Errors) Error() string {
 	var errors []string
 	for _, err := range e {
@@ -189,17 +218,22 @@ func (s *State) AddTask(t Task) error {
 	return nil
 }
 
-
 // RunTasks runs all pending tasks registered via AddTask.
 // This is called by the pipe running functions and generally
 // there's no reason to call it directly.
 func (s *State) RunTasks() error {
+	if s.Ctx == nil {
+		s.Ctx = context.Background()
+	}
+
 	done := make(chan error, len(s.pendingTasks))
 	for _, f := range s.pendingTasks {
 		go func(pt *pendingTask) {
 			pt.wait()
 			var err error
 			if pt.cancel == 0 {
+				pt.s.Ctx = s.Ctx
+				pt.s.logger = s.logger
 				err = pt.t.Run(&pt.s)
 			}
 			pt.done(err)
@@ -221,7 +255,12 @@ func (s *State) RunTasks() error {
 				pt.t.Kill()
 			}
 		}
-		if errs == nil || errs[len(errs)-1] != ErrTimeout && errs[len(errs)-1] != ErrKilled {
+		var lastErr error
+		if errs != nil {
+			lastErr = errs[len(errs)-1]
+		}
+		if errs == nil || lastErr != ErrTimeout && lastErr != ErrKilled &&
+			lastErr != context.Canceled && lastErr != context.DeadlineExceeded {
 			errs = append(errs, err)
 			if discardErr(err) {
 				badErr = true
@@ -231,10 +270,13 @@ func (s *State) RunTasks() error {
 		}
 	}
 
-	for _ = range s.pendingTasks {
+	for range s.pendingTasks {
 		var err error
 		select {
 		case err = <-done:
+		case <-s.Ctx.Done():
+			fail(s.Ctx.Err())
+			err = <-done
 		case <-timeout:
 			fail(ErrTimeout)
 			err = <-done
@@ -338,7 +380,24 @@ func firstErr(err1, err2 error) error {
 //
 // See functions Output, CombinedOutput, and DividedOutput.
 func Run(p Pipe) error {
+	return RunContext(context.Background(), nil, p)
+}
+
+// RunContext runs the p pipe discarding its output.
+// RunContext is like Run but includes optional context
+// and/or optional logger.
+//
+// The pipe is killed if the context is done before pipe is finished.
+//
+// If logger is specified, then verbose logging of each task is
+// performed as each task in the pipe is executed.
+//
+// See functions OutputContext, CombinedOutputContext, and DividedOutputContext.
+func RunContext(ctx context.Context, logger StdLogger, p Pipe) error {
 	s := NewState(nil, nil)
+	s.logger = logger
+	s.Ctx = ctx
+	s.Timeout = 0
 	err := p(s)
 	if err == nil {
 		err = s.RunTasks()
@@ -354,6 +413,7 @@ func Run(p Pipe) error {
 func RunTimeout(p Pipe, timeout time.Duration) error {
 	s := NewState(nil, nil)
 	s.Timeout = timeout
+	s.Ctx = nil
 	err := p(s)
 	if err == nil {
 		err = s.RunTasks()
@@ -365,8 +425,25 @@ func RunTimeout(p Pipe, timeout time.Duration) error {
 //
 // See functions Run, CombinedOutput, and DividedOutput.
 func Output(p Pipe) ([]byte, error) {
+	return OutputContext(context.Background(), nil, p)
+}
+
+// OutputContext runs the p pipe and returns its stdout output.
+// OutputContext is like Output but includes optional context
+// and/or optional logger.
+//
+// The pipe is killed if the context is done before pipe is finished.
+//
+// If logger is specified, then verbose logging of each task is
+// performed as each task in the pipe is executed.
+//
+// See functions RunContext, CombinedOutputContext, and DividedOutputContext.
+func OutputContext(ctx context.Context, logger StdLogger, p Pipe) ([]byte, error) {
 	outb := &OutputBuffer{}
 	s := NewState(outb, nil)
+	s.logger = logger
+	s.Ctx = ctx
+	s.Timeout = 0
 	err := p(s)
 	if err == nil {
 		err = s.RunTasks()
@@ -395,8 +472,26 @@ func OutputTimeout(p Pipe, timeout time.Duration) ([]byte, error) {
 //
 // See functions Run, Output, and DividedOutput.
 func CombinedOutput(p Pipe) ([]byte, error) {
+	return CombinedOutputContext(context.Background(), nil, p)
+}
+
+// CombinedOutputContext runs the p pipe and returns its stdout and stderr
+// outputs merged together.
+// CombinedOutputContext is like CombinedOutput but includes optional context
+// and/or optional logger.
+//
+// The pipe is killed if the context is done before pipe is finished.
+//
+// If logger is specified, then verbose logging of each task is
+// performed as each task in the pipe is executed.
+//
+// See functions RunContext, OutputContext, and DividedOutputContext.
+func CombinedOutputContext(ctx context.Context, logger StdLogger, p Pipe) ([]byte, error) {
 	outb := &OutputBuffer{}
 	s := NewState(outb, outb)
+	s.logger = logger
+	s.Ctx = ctx
+	s.Timeout = 0
 	err := p(s)
 	if err == nil {
 		err = s.RunTasks()
@@ -425,9 +520,26 @@ func CombinedOutputTimeout(p Pipe, timeout time.Duration) ([]byte, error) {
 //
 // See functions Run, Output, and CombinedOutput.
 func DividedOutput(p Pipe) (stdout []byte, stderr []byte, err error) {
+	return DividedOutputContext(context.Background(), nil, p)
+}
+
+// DividedOutputContext runs the p pipe and returns its stdout and stderr outputs.
+// DividedOutputContext is like DividedOutput but includes optional context
+// and/or optional logger.
+//
+// The pipe is killed if the context is done before pipe is finished.
+//
+// If logger is specified, then verbose logging of each task is
+// performed as each task in the pipe is executed.
+//
+// See functions RunContext, OutputContext, and CombinedOutputContext.
+func DividedOutputContext(ctx context.Context, logger StdLogger, p Pipe) (stdout []byte, stderr []byte, err error) {
 	outb := &OutputBuffer{}
 	errb := &OutputBuffer{}
 	s := NewState(outb, errb)
+	s.logger = logger
+	s.Ctx = ctx
+	s.Timeout = 0
 	err = p(s)
 	if err == nil {
 		err = s.RunTasks()
@@ -505,7 +617,15 @@ func (f *execTask) Run(s *State) error {
 		f.m.Unlock()
 		return nil
 	}
-	cmd := exec.Command(f.name, f.args...)
+	if s.logger != nil {
+		printArgs := make([]interface{}, len(f.args)+1)
+		printArgs[0] = interface{}(f.name)
+		for idx, stringArg := range f.args {
+			printArgs[idx+1] = stringArg
+		}
+		s.logger.Println(printArgs...)
+	}
+	cmd := exec.CommandContext(s.Ctx, f.name, f.args...)
 	cmd.Dir = s.Dir
 	cmd.Env = s.Env
 	cmd.Stdin = s.Stdin
@@ -733,6 +853,10 @@ func TaskFunc(f func(s *State) error) Pipe {
 // string to the pipe's stdout.
 func Print(args ...interface{}) Pipe {
 	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("pipe.Print %s\n",
+				strings.Split(fmt.Sprint(args...), "\n")[0])
+		}
 		_, err := s.Stdout.Write([]byte(fmt.Sprint(args...)))
 		return err
 	})
@@ -742,6 +866,10 @@ func Print(args ...interface{}) Pipe {
 // string to the pipe's stdout.
 func Println(args ...interface{}) Pipe {
 	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("pipe.Println %s\n",
+				strings.Split(fmt.Sprintln(args...), "\n")[0])
+		}
 		_, err := s.Stdout.Write([]byte(fmt.Sprintln(args...)))
 		return err
 	})
@@ -751,6 +879,10 @@ func Println(args ...interface{}) Pipe {
 // the resulting string to the pipe's stdout.
 func Printf(format string, args ...interface{}) Pipe {
 	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("pipe.Printf %s\n",
+				strings.Split(fmt.Sprintf(format, args...), "\n")[0])
+		}
 		_, err := s.Stdout.Write([]byte(fmt.Sprintf(format, args...)))
 		return err
 	})
@@ -759,6 +891,9 @@ func Printf(format string, args ...interface{}) Pipe {
 // Read reads data from r and writes it to the pipe's stdout.
 func Read(r io.Reader) Pipe {
 	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("pipe.Read %s\n", r)
+		}
 		_, err := io.Copy(s.Stdout, r)
 		return err
 	})
@@ -766,7 +901,15 @@ func Read(r io.Reader) Pipe {
 
 // Write writes to w the data read from the pipe's stdin.
 func Write(w io.Writer) Pipe {
+	return verboseWrite("pipe.Write", w)
+}
+
+// verboseWrite writes to w the data read from the pipe's stdin.
+func verboseWrite(verboseStr string, w io.Writer) Pipe {
 	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("%s %s\n", verboseStr, w)
+		}
 		_, err := io.Copy(w, s.Stdin)
 		return err
 	})
@@ -774,13 +917,16 @@ func Write(w io.Writer) Pipe {
 
 // Discard reads data from the pipe's stdin and discards it.
 func Discard() Pipe {
-	return Write(ioutil.Discard)
+	return verboseWrite("pipe.Discard", ioutil.Discard)
 }
 
 // Tee reads data from the pipe's stdin and writes it both to
 // the pipe's stdout and to w.
 func Tee(w io.Writer) Pipe {
 	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("pipe.Tee %s\n", w)
+		}
 		_, err := io.Copy(w, io.TeeReader(s.Stdin, s.Stdout))
 		return err
 	})
@@ -790,6 +936,9 @@ func Tee(w io.Writer) Pipe {
 // pipe's stdout.
 func ReadFile(path string) Pipe {
 	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("pipe.ReadFile %s\n", path)
+		}
 		file, err := os.Open(s.Path(path))
 		if err != nil {
 			return err
@@ -804,6 +953,9 @@ func ReadFile(path string) Pipe {
 // pipe's stdin. If the file doesn't exist, it is created with perm.
 func WriteFile(path string, perm os.FileMode) Pipe {
 	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("pipe.WriteFile %s %s\n", path, perm)
+		}
 		file, err := os.OpenFile(s.Path(path), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 		if err != nil {
 			return err
@@ -818,6 +970,9 @@ func WriteFile(path string, perm os.FileMode) Pipe {
 // with perm.
 func AppendFile(path string, perm os.FileMode) Pipe {
 	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("pipe.AppendFile %s %s\n", path, perm)
+		}
 		file, err := os.OpenFile(s.Path(path), os.O_WRONLY|os.O_CREATE|os.O_APPEND, perm)
 		if err != nil {
 			return err
@@ -832,6 +987,9 @@ func AppendFile(path string, perm os.FileMode) Pipe {
 // exist, it is created with perm.
 func TeeWriteFile(path string, perm os.FileMode) Pipe {
 	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("pipe.TeeWriteFile %s %s\n", path, perm)
+		}
 		file, err := os.OpenFile(s.Path(path), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 		if err != nil {
 			return err
@@ -846,6 +1004,9 @@ func TeeWriteFile(path string, perm os.FileMode) Pipe {
 // exist, it is created with perm.
 func TeeAppendFile(path string, perm os.FileMode) Pipe {
 	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("pipe.TeeAppendFile %s %s\n", path, perm)
+		}
 		file, err := os.OpenFile(s.Path(path), os.O_WRONLY|os.O_CREATE|os.O_APPEND, perm)
 		if err != nil {
 			return err
@@ -858,7 +1019,16 @@ func TeeAppendFile(path string, perm os.FileMode) Pipe {
 // Replace filters lines read from the pipe's stdin and writes
 // the returned values to stdout.
 func Replace(f func(line []byte) []byte) Pipe {
+	return verboseReplace("pipe.Replace", f)
+}
+
+// verboseReplace filters lines read from the pipe's stdin and writes
+// the returned values to stdout.
+func verboseReplace(verboseStr string, f func(line []byte) []byte) Pipe {
 	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("%s %s\n", verboseStr, f)
+		}
 		r := bufio.NewReader(s.Stdin)
 		for {
 			line, err := r.ReadBytes('\n')
@@ -886,7 +1056,7 @@ func Replace(f func(line []byte) []byte) Pipe {
 // for which f is true are written to the pipe's stdout.
 // The line provided to f has '\n' and '\r' trimmed.
 func Filter(f func(line []byte) bool) Pipe {
-	return Replace(func(line []byte) []byte {
+	return verboseReplace("pipe.Filter", func(line []byte) []byte {
 		if f(bytes.TrimRight(line, "\r\n")) {
 			return line
 		}
@@ -899,6 +1069,80 @@ func RenameFile(fromPath, toPath string) Pipe {
 	// Register it as a task function so that within scripts
 	// it holds until all the preceding flushing is done.
 	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("pipe.RenameFile %s %s\n", fromPath, toPath)
+		}
 		return os.Rename(s.Path(fromPath), s.Path(toPath))
+	})
+}
+
+// Sleep pauses for duration d.
+func Sleep(d time.Duration) Pipe {
+	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("pipe.Sleep %s\n", d)
+		}
+		time.Sleep(d)
+		return nil
+	})
+}
+
+// verboseReduce applies function cumulatively to stdin lines,
+// writing the single reduced line to stdout.
+// The starting cumulative value is startCumulative and can be nil;
+// this is also the value if there are no stdin lines.
+// The first time function is called, x will be startCumulative.
+// After the first time, x will be the accumulated value.
+// The y value will always be the iterated stdin line.
+// Note no trailing newline is written to stdout,
+// so function should include trailing newline in result if desired.
+func verboseReduce(verboseStr string, startCumulative []byte, f func(x, y []byte) []byte) Pipe {
+	return TaskFunc(func(s *State) error {
+		if s.logger != nil {
+			s.logger.Printf("%s %s\n", verboseStr, f)
+		}
+		accumulated := startCumulative
+		r := bufio.NewReader(s.Stdin)
+		for {
+			line, err := r.ReadBytes('\n')
+			if err == io.EOF {
+				if len(line) > 0 {
+					accumulated = f(accumulated, line)
+				}
+				break
+			} else if err != nil {
+				return err
+			} else if line != nil {
+				accumulated = f(accumulated, line)
+			}
+		}
+		_, err := s.Stdout.Write(accumulated)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// Reduce applies function cumulatively to stdin lines,
+// writing the single reduced line to stdout.
+// The starting cumulative value is startCumulative and can be nil;
+// this is also the value if there are no stdin lines.
+// The first time function is called, x will be startCumulative.
+// After the first time, x will be the accumulated value.
+// The y value will always be the iterated stdin line.
+// Note no trailing newline is written to stdout,
+// so function should include trailing newline in result if desired.
+func Reduce(startCumulative []byte, f func(x, y []byte) []byte) Pipe {
+	return verboseReduce("pipe.Reduce", startCumulative, f)
+}
+
+// CountLines writes the count of stdin lines to stdout.
+// Note there is no trailing newline written to stdout.
+func CountLines() Pipe {
+	return verboseReduce("pipe.CountLines", []byte("0"), func(x, y []byte) []byte {
+		count, _ := strconv.Atoi(strings.TrimSpace(string(x)))
+		count++
+		return []byte(strconv.Itoa(count))
 	})
 }
